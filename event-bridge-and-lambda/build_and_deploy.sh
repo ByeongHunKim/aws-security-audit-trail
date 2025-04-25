@@ -656,8 +656,8 @@ deploy_stack() {
 
   echo "Deploying CloudFormation stack in $region..."
 
-  # 직접 값 입력
-  local SLACK_WEBHOOK_URL="${SLACK_WEBHOOK_URL:-https://hooks.slack.com/services/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}"
+  # todo parameter
+  local SLACK_WEBHOOK_URL="${SLACK_WEBHOOK_URL:-https://hooks.slack.com/services/}"
   local ALLOWED_IPS="192.168.1.1"
 
   local params=(
