@@ -101,25 +101,25 @@ Resources:
       TargetKeyId: !Ref CloudTrailKMSKey
 
   # CloudTrail Settings
-CloudTrail:
-  Type: AWS::CloudTrail::Trail
-  DependsOn:
-    - CloudTrailS3BucketPolicy
-  Properties:
-    TrailName: !Ref TrailName
-    S3BucketName: !Ref CloudTrailS3Bucket
-    IsLogging: true
-    IsMultiRegionTrail: true
-    EnableLogFileValidation: true
-    IncludeGlobalServiceEvents: true
-    KMSKeyId: !Ref CloudTrailKMSKey
-    # Advanced Event Selector Settings
-    AdvancedEventSelectors:
-      - Name: Management events selector
-        FieldSelectors:
-          - Field: eventCategory
-            Equals:
-              - Management
+  CloudTrail:
+    Type: AWS::CloudTrail::Trail
+    DependsOn:
+      - CloudTrailS3BucketPolicy
+    Properties:
+      TrailName: !Ref TrailName
+      S3BucketName: !Ref CloudTrailS3Bucket
+      IsLogging: true
+      IsMultiRegionTrail: true
+      EnableLogFileValidation: true
+      IncludeGlobalServiceEvents: true
+      KMSKeyId: !Ref CloudTrailKMSKey
+      # Advanced Event Selector Settings
+      AdvancedEventSelectors:
+        - Name: Management events selector
+          FieldSelectors:
+            - Field: eventCategory
+              Equals:
+                - Management
 
 Outputs:
   CloudTrailName:
