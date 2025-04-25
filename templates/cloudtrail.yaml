@@ -20,7 +20,7 @@ Resources:
     #   - Retain: Keeps the bucket when stack is deleted (recommended for production)
     #   - Delete: Removes the bucket when stack is deleted (for testing only)
     #   - Snapshot: Not applicable for S3 buckets
-    DeletionPolicy: Retain
+    DeletionPolicy: Delete
     Properties:
       BucketName: !Sub aws-cloudtrail-logs-${AWS::AccountId}-${S3BucketSuffix}
       # Server-side encryption settings
