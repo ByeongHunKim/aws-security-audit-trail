@@ -31,7 +31,7 @@ assignees: ''
 ```
 
 **Configuration / 설정**
-문제와 관련된 Istio 설정이나 YAML 파일을 첨부해주세요
+문제와 관련된 설정이나 YAML 파일을 첨부해주세요
 
 ```yaml
 여기에 설정 파일을 붙여넣으세요
