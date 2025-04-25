@@ -1,0 +1,448 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CloudFormation Template for AWS Security Monitoring with CloudTrail and EventBridge'
+
+Parameters:
+  SlackWebhookUrl:
+    Type: String
+    Description: Slack Webhook URL for sending notifications
+    NoEcho: true
+
+  AllowedIpAddresses:
+    Type: String
+    Description: Comma-separated list of allowed IP addresses
+    Default: '127.0.0.1'
+
+  IsPrimaryRegion:
+    Type: String
+    Default: "false"
+    AllowedValues:
+      - "true"
+      - "false"
+    Description: "Whether this is the primary region for deployment"
+
+  # Remove the fixed S3 bucket name and provide it as a parameter
+  S3BucketName:
+    Type: String
+    # todo make input
+    Default: "aws-cloudtrail-logs-<123123>-security"
+    Description: "S3 bucket name for Lambda code and layers"
+
+Resources:
+  #################################################
+  # Lambda Layer
+  #################################################
+  EventMonitorUtilsLayer:
+    Type: AWS::Lambda::LayerVersion
+    Properties:
+      LayerName: event-monitor-utils-layer
+      Description: Common utilities for event monitoring Lambda functions
+      Content:
+        S3Bucket: !Ref S3BucketName
+        S3Key: layers/event-monitor-utils-layer.zip
+      CompatibleRuntimes:
+        - python3.10
+        - python3.11
+      CompatibleArchitectures:
+        - x86_64
+        - arm64
+
+  #################################################
+  # Lambda Functions
+  #################################################
+  IAMEventHandlerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: IAMEventHandler
+      Runtime: python3.10
+      Handler: lambda_function.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 128
+      Environment:
+        Variables:
+          HOOK_URL: !Ref SlackWebhookUrl
+          ALLOWED_IP: !Ref AllowedIpAddresses
+      Code:
+        S3Bucket: !Ref S3BucketName  # 파라미터 참조
+        S3Key: functions/IAMEventHandler.zip
+      Layers:
+        - !Ref EventMonitorUtilsLayer
+
+  ConsoleLoginEventHandlerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: ConsoleLoginEventHandler
+      Runtime: python3.10
+      Handler: lambda_function.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 128
+      Environment:
+        Variables:
+          HOOK_URL: !Ref SlackWebhookUrl
+          ALLOWED_IP: !Ref AllowedIpAddresses
+      Code:
+        S3Bucket: !Ref S3BucketName
+        S3Key: functions/ConsoleLoginEventHandler.zip
+      Layers:
+        - !Ref EventMonitorUtilsLayer
+
+  SecretsManagerEventHandlerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: SecretsManagerEventHandler
+      Runtime: python3.10
+      Handler: lambda_function.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 128
+      Environment:
+        Variables:
+          HOOK_URL: !Ref SlackWebhookUrl
+          ALLOWED_IP: !Ref AllowedIpAddresses
+      Code:
+        S3Bucket: !Ref S3BucketName
+        S3Key: functions/SecretsManagerEventHandler.zip
+      Layers:
+        - !Ref EventMonitorUtilsLayer
+
+  EC2EventHandlerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: EC2EventHandler
+      Runtime: python3.10
+      Handler: lambda_function.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 128
+      Environment:
+        Variables:
+          HOOK_URL: !Ref SlackWebhookUrl
+          ALLOWED_IP: !Ref AllowedIpAddresses
+      Code:
+        S3Bucket: !Ref S3BucketName
+        S3Key: functions/EC2EventHandler.zip
+      Layers:
+        - !Ref EventMonitorUtilsLayer
+
+  RDSEventHandlerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: RDSEventHandler
+      Runtime: python3.10
+      Handler: lambda_function.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 128
+      Environment:
+        Variables:
+          HOOK_URL: !Ref SlackWebhookUrl
+          ALLOWED_IP: !Ref AllowedIpAddresses
+      Code:
+        S3Bucket: !Ref S3BucketName
+        S3Key: functions/RDSEventHandler.zip
+      Layers:
+        - !Ref EventMonitorUtilsLayer
+
+  #################################################
+  # Lambda Permissions
+  #################################################
+  IAMEventHandlerPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref IAMEventHandlerFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt IAMEventRule.Arn
+
+  ConsoleLoginEventHandlerPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ConsoleLoginEventHandlerFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ConsoleLoginEventRule.Arn
+
+  SecretsManagerEventHandlerPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref SecretsManagerEventHandlerFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt SecretsManagerEventRule.Arn
+
+  EC2EventHandlerPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref EC2EventHandlerFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt EC2EventRule.Arn
+
+  RDSEventHandlerPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref RDSEventHandlerFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt RDSEventRule.Arn
+
+  #################################################
+  # EventBridge Event Bus
+  #################################################
+  SecurityEventBus:
+    Type: AWS::Events::EventBus
+    Properties:
+      Name: security-event-bus
+
+  #################################################
+  # EventBridge Rules
+  #################################################
+  IAMEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: IAMEventRule
+      EventPattern: >-
+        {"source":["aws.iam"],"detail-type":["AWS API Call via
+        CloudTrail"],"detail":{"eventSource":["iam.amazonaws.com"],"eventName":["CreateUser","DeleteUser","UpdateUser","AddUserToGroup","RemoveUserFromGroup","CreateGroup","DeleteGroup","UpdateGroup","AttachUserPolicy","DetachUserPolicy","AttachGroupPolicy","DetachGroupPolicy","PutUserPolicy","DeleteUserPolicy","PutGroupPolicy","DeleteGroupPolicy","CreateAccessKey","DeleteAccessKey","UpdateAccessKey","CreateLoginProfile","DeleteLoginProfile","UpdateLoginProfile","UpdateAccountPasswordPolicy"]}}
+      State: ENABLED
+      Description: aws iam event notification
+      EventBusName: default
+      Targets:
+        - Id: IAMEventHandlerTarget
+          Arn: !GetAtt IAMEventHandlerFunction.Arn
+
+  ConsoleLoginEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: ConsoleLoginEventRule
+      EventPattern: >-
+        {"source":["aws.signin"],"detail":{"eventSource":["signin.amazonaws.com"],"eventName":["ConsoleLogin"]}}
+      State: ENABLED
+      Description: aws console login notification
+      EventBusName: default
+      Targets:
+        - Id: ConsoleLoginEventHandlerTarget
+          Arn: !GetAtt ConsoleLoginEventHandlerFunction.Arn
+
+  SecretsManagerEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: SecretsManagerEventRule
+      EventPattern: |-
+        {
+            "source": ["aws.secretsmanager"],
+            "detail-type": ["AWS API Call via CloudTrail"],
+            "detail": {
+              "eventSource": ["secretsmanager.amazonaws.com"],
+              "eventName": [
+                "CreateSecret",
+                "UpdateSecret",
+                "DeleteSecret",
+                "GetSecretValue",
+                "BatchGetSecretValue",
+                "RestoreSecret",
+                "PutResourcePolicy",
+                "DeleteResourcePolicy",
+                "RotateSecret",
+                "PutRotationSchedule",
+                "PutSecretValue",
+                "DescribeSecret"
+              ],
+              "userIdentity": {
+                "type": ["Root", "IAMUser"]
+              }
+            }
+          }
+      State: ENABLED_WITH_ALL_CLOUDTRAIL_MANAGEMENT_EVENTS
+      Description: aws secrets manager event notification
+      EventBusName: !Ref SecurityEventBus
+      Targets:
+        - Id: SecretsManagerEventHandlerTarget
+          Arn: !GetAtt SecretsManagerEventHandlerFunction.Arn
+
+  EC2EventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: EC2EventRule
+      EventPattern: >-
+        {"source":["aws.ec2","aws.ec2-instance-connect"],"detail-type":["AWS API
+        Call via
+        CloudTrail"],"detail":{"eventSource":["ec2.amazonaws.com","ec2-instance-connect.amazonaws.com"],"eventName":["AuthorizeSecurityGroupIngress","CreateInstanceConnectEndpoint","OpenTunnel","SendSSHPublicKey","RevokeSecurityGroupIngress"]}}
+      State: ENABLED
+      Description: ec2 event notification
+      EventBusName: !Ref SecurityEventBus
+      Targets:
+        - Id: EC2EventHandlerTarget
+          Arn: !GetAtt EC2EventHandlerFunction.Arn
+
+  RDSEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: RDSEventRule
+      EventPattern: >-
+        {"source":["aws.rds"],"detail-type":["AWS API Call via
+        CloudTrail"],"detail":{"eventSource":["rds.amazonaws.com"],"eventName":["EnableHttpEndpoint"]}}
+      State: ENABLED
+      Description: aws rds event notification
+      EventBusName: !Ref SecurityEventBus
+      Targets:
+        - Id: RDSEventHandlerTarget
+          Arn: !GetAtt RDSEventHandlerFunction.Arn
+
+  #################################################
+  # Cross-Region Event Rules
+  #################################################
+  SecretsManagerCrossRegionRule:
+    Type: AWS::Events::Rule
+    Condition: IsNotPrimaryRegion
+    Properties:
+      Name: SecretsManagerCrossRegionRule
+      EventPattern: |-
+        {
+            "source": ["aws.secretsmanager"],
+            "detail-type": ["AWS API Call via CloudTrail"],
+            "detail": {
+              "eventSource": ["secretsmanager.amazonaws.com"],
+              "eventName": [
+                "CreateSecret",
+                "UpdateSecret",
+                "DeleteSecret",
+                "GetSecretValue",
+                "BatchGetSecretValue",
+                "RestoreSecret",
+                "PutResourcePolicy",
+                "DeleteResourcePolicy",
+                "RotateSecret",
+                "PutRotationSchedule",
+                "PutSecretValue",
+                "DescribeSecret"
+              ],
+              "userIdentity": {
+                "type": ["Root", "IAMUser"]
+              }
+            }
+          }
+      State: ENABLED_WITH_ALL_CLOUDTRAIL_MANAGEMENT_EVENTS
+      Description: Cross-Region event delivery to security-event-bus in us-east-1
+      EventBusName: default
+      Targets:
+        - Id: SecretsManagerCrossRegionTarget
+          Arn: !Sub arn:${AWS::Partition}:events:us-east-1:${AWS::AccountId}:event-bus/security-event-bus
+          RoleArn: !GetAtt CrossRegionEventBusRole.Arn
+
+  EC2CrossRegionRule:
+    Type: AWS::Events::Rule
+    Condition: IsNotPrimaryRegion
+    Properties:
+      Name: EC2CrossRegionRule
+      EventPattern: >-
+        {"source":["aws.ec2","aws.ec2-instance-connect"],"detail-type":["AWS API
+        Call via
+        CloudTrail"],"detail":{"eventSource":["ec2.amazonaws.com","ec2-instance-connect.amazonaws.com"],"eventName":["AuthorizeSecurityGroupIngress","CreateInstanceConnectEndpoint","OpenTunnel","SendSSHPublicKey","RevokeSecurityGroupIngress"]}}
+      State: ENABLED
+      Description: Cross-Region event delivery to security-event-bus in us-east-1
+      EventBusName: default
+      Targets:
+        - Id: EC2CrossRegionTarget
+          Arn: !Sub arn:${AWS::Partition}:events:us-east-1:${AWS::AccountId}:event-bus/security-event-bus
+          RoleArn: !GetAtt CrossRegionEventBusRole.Arn
+
+  RDSCrossRegionRule:
+    Type: AWS::Events::Rule
+    Condition: IsNotPrimaryRegion
+    Properties:
+      Name: RDSCrossRegionRule
+      EventPattern: >-
+        {"source":["aws.rds"],"detail-type":["AWS API Call via
+        CloudTrail"],"detail":{"eventSource":["rds.amazonaws.com"],"eventName":["EnableHttpEndpoint"]}}
+      State: ENABLED
+      Description: Cross-Region event delivery to security-event-bus in us-east-1
+      EventBusName: default
+      Targets:
+        - Id: RDSCrossRegionTarget
+          Arn: !Sub arn:${AWS::Partition}:events:us-east-1:${AWS::AccountId}:event-bus/security-event-bus
+          RoleArn: !GetAtt CrossRegionEventBusRole.Arn
+
+  #################################################
+  # IAM Roles
+  #################################################
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${AWS::StackName}-lambda-execution-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: SecurityMonitoringPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*
+
+  CrossRegionEventBusRole:
+    Type: AWS::IAM::Role
+    Condition: IsNotPrimaryRegion
+    Properties:
+      RoleName: !Sub ${AWS::StackName}-cross-region-event-bus-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: PutEventsToCrossRegionBus
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: events:PutEvents
+                Resource: !Sub arn:aws:events:us-east-1:${AWS::AccountId}:event-bus/security-event-bus
+
+Conditions:
+  IsNotPrimaryRegion: !Not [!Equals [!Ref "AWS::Region", "us-east-1"]]
+  IsPrimaryRegion: !Equals [!Ref "IsPrimaryRegion", "true"]
+
+Outputs:
+  SecurityEventBusArn:
+    Description: ARN of the Security Event Bus
+    Value: !GetAtt SecurityEventBus.Arn
+    Condition: IsPrimaryRegion
+
+  IAMEventHandlerArn:
+    Description: ARN of the IAM Event Handler Lambda function
+    Value: !GetAtt IAMEventHandlerFunction.Arn
+
+  ConsoleLoginEventHandlerArn:
+    Description: ARN of the Console Login Event Handler Lambda function
+    Value: !GetAtt ConsoleLoginEventHandlerFunction.Arn
+
+  SecretsManagerEventHandlerArn:
+    Description: ARN of the Secrets Manager Event Handler Lambda function
+    Value: !GetAtt SecretsManagerEventHandlerFunction.Arn
+
+  EC2EventHandlerArn:
+    Description: ARN of the EC2 Event Handler Lambda function
+    Value: !GetAtt EC2EventHandlerFunction.Arn
+
+  RDSEventHandlerArn:
+    Description: ARN of the RDS Event Handler Lambda function
+    Value: !GetAtt RDSEventHandlerFunction.Arn
+
+  S3BucketName:
+    Description: Name of the S3 bucket containing Lambda code and layers
+    Value: !Ref S3BucketName
