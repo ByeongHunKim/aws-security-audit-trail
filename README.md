@@ -1,16 +1,41 @@
-# AWS Security Audit Trail - CloudFormation
+# AWS Security Monitoring Solution
 
-## Template Components
-- **CloudTrail**: Logging API activities across all regions and global services
-- **S3 Bucket**: Encrypted log storage
-- **S3 Bucket Policy**: Allows CloudTrail to write logs
-- **KMS Key**: For log file encryption
-- **Advanced Event Selectors**: Management event filtering
+This CloudFormation-based solution implements a comprehensive security monitoring system for AWS, combining CloudTrail, EventBridge, and Lambda to detect and alert on suspicious activities across multiple AWS regions.
+
+## Architecture
+
+![img.png](images/architecture.png)
+
+
+## Features
+
+- **Multi-Region Monitoring**: Central collection of security events from all AWS regions
+- **Real-time Alerts**: Immediate Slack notifications for critical security events
+- **Cross-Account Support**: Deploy across multiple AWS accounts with consistent configuration
+- **Customizable Filtering**: Focus on the security events that matter to your organization
+- **Comprehensive Coverage**: Monitors IAM, Console Logins, Secrets Manager, EC2, and RDS activities
+
+## Monitored Events
+
+| Service | Events |
+|---------|--------|
+| **IAM** | CreateUser, DeleteUser, UpdateUser, AddUserToGroup, RemoveUserFromGroup, etc. |
+| **Console** | Login events, including failed attempts |
+| **Secrets Manager** | CreateSecret, DeleteSecret, GetSecretValue, PutResourcePolicy, etc. |
+| **EC2** | SecurityGroup changes, Instance Connect, SSH access |
+| **RDS** | HTTP Endpoint exposure |
 
 ## Prerequisites
-- AWS account
-- AWS CLI installed and configured
-- Permissions to deploy CloudFormation stacks
+
+- An AWS account with CloudFormation permissions
+- A Slack workspace with webhook URL for notifications
+- Git and AWS CLI installed locally
+
+## Deployment
+
+The deployment consists of two main parts:
+1. CloudTrail configuration for security logging and S3 Bucket for store logs
+2. Security monitoring system (EventBridge, Lambda Functions)
 
 ## Deployment Instructions
 1. Clone this repository:
@@ -77,3 +102,4 @@ aws cloudtrail get-event-selectors --trail-name cloudtrail-security-logs --regio
 3. Commit your changes (`git commit -m 'Add some amazing feature'`)
 4. Push to the branch (`git push origin feature/amazing-feature`)
 5. Create a Pull Request
+
