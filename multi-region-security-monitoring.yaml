@@ -1,0 +1,1192 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Multi-Region AWS Security Monitoring Solution'
+
+Parameters:
+  SlackWebhookUrl:
+    Type: String
+    Description: Slack Webhook URL for sending notifications
+    NoEcho: true
+
+  AllowedIpAddresses:
+    Type: String
+    Description: Comma-separated list of allowed IP addresses
+    Default: '127.0.0.1'
+
+  DeploymentType:
+    Type: String
+    Default: 'Primary'
+    AllowedValues:
+      - 'Primary'
+      - 'Regional'
+    Description: 'Primary: Global services (IAM, Console) + Regional. Regional: Only regional services'
+
+  PrimaryRegion:
+    Type: String
+    Default: 'us-east-1'
+    Description: 'Primary region where global events are processed'
+
+Conditions:
+  IsPrimaryRegion: !Equals [!Ref DeploymentType, 'Primary']
+  IsRegionalOnly: !Equals [!Ref DeploymentType, 'Regional']
+
+Resources:
+  #################################################
+  # CloudTrail and S3 (Primary Region Only)
+  #################################################
+  CloudTrailS3Bucket:
+    Type: AWS::S3::Bucket
+    Condition: IsPrimaryRegion
+    DeletionPolicy: Retain
+    Properties:
+      BucketName: !Sub cloudtrail-${AWS::AccountId}-security
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: false
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        IgnorePublicAcls: true
+        BlockPublicPolicy: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+
+  CloudTrailS3BucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Condition: IsPrimaryRegion
+    Properties:
+      Bucket: !Ref CloudTrailS3Bucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: !Sub AWSCloudTrailAclCheck-${AWS::Region}
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:GetBucketAcl
+            Resource: !Sub arn:aws:s3:::${CloudTrailS3Bucket}
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub arn:aws:cloudtrail:${AWS::Region}:${AWS::AccountId}:trail/security-cloudtrail-${AWS::StackName}
+          - Sid: !Sub AWSCloudTrailWrite-${AWS::Region}
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub arn:aws:s3:::${CloudTrailS3Bucket}/AWSLogs/${AWS::AccountId}/*
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub arn:aws:cloudtrail:${AWS::Region}:${AWS::AccountId}:trail/security-cloudtrail-${AWS::StackName}
+                s3:x-amz-acl: bucket-owner-full-control
+
+  CloudTrailKMSKey:
+    Type: AWS::KMS::Key
+    Condition: IsPrimaryRegion
+    Properties:
+      Description: KMS key for CloudTrail log encryption
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:aws:iam::${AWS::AccountId}:root
+            Action: kms:*
+            Resource: '*'
+          - Sid: Allow CloudTrail to encrypt logs
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action:
+              - kms:GenerateDataKey*
+              - kms:Decrypt
+            Resource: '*'
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub arn:aws:cloudtrail:${AWS::Region}:${AWS::AccountId}:trail/security-cloudtrail-${AWS::StackName}
+
+  CloudTrail:
+    Type: AWS::CloudTrail::Trail
+    Condition: IsPrimaryRegion
+    DependsOn:
+      - CloudTrailS3BucketPolicy
+    Properties:
+      TrailName: !Sub security-cloudtrail-${AWS::StackName}
+      S3BucketName: !Ref CloudTrailS3Bucket
+      IsLogging: true
+      IsMultiRegionTrail: true
+      EnableLogFileValidation: true
+      IncludeGlobalServiceEvents: true
+      KMSKeyId: !Ref CloudTrailKMSKey
+      AdvancedEventSelectors:
+        - Name: Management events selector
+          FieldSelectors:
+            - Field: eventCategory
+              Equals:
+                - Management
+
+  #################################################
+  # Lambda Execution Role (All Regions)
+  #################################################
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${AWS::StackName}-lambda-execution-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  #################################################
+  # Cross-Region Event Bridge Role (Regional Only)
+  #################################################
+  CrossRegionEventRole:
+    Type: AWS::IAM::Role
+    Condition: IsRegionalOnly
+    Properties:
+      RoleName: !Sub ${AWS::StackName}-cross-region-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CrossRegionEventPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: events:PutEvents
+                Resource: !Sub arn:aws:events:${PrimaryRegion}:${AWS::AccountId}:event-bus/security-event-bus
+
+  #################################################
+  # EventBridge Event Bus (Primary Region Only)
+  #################################################
+  SecurityEventBus:
+    Type: AWS::Events::EventBus
+    Condition: IsPrimaryRegion
+    Properties:
+      Name: security-event-bus
+
+  #################################################
+  # Global Service Lambda Functions (Primary Region Only)
+  #################################################
+  IAMEventHandlerFunction:
+    Type: AWS::Lambda::Function
+    Condition: IsPrimaryRegion
+    Properties:
+      FunctionName: IAMEventHandler
+      Runtime: python3.10
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 128
+      Environment:
+        Variables:
+          HOOK_URL: !Ref SlackWebhookUrl
+          ALLOWED_IP: !Ref AllowedIpAddresses
+      Code:
+        ZipFile: |
+          import json
+          import os
+          from datetime import datetime, timedelta
+          from urllib.request import Request, urlopen
+          from urllib.error import URLError, HTTPError
+          import logging
+
+          class BaseHandler:
+              def __init__(self):
+                  self.logger = logging.getLogger()
+                  self.logger.setLevel(logging.INFO)
+                  self.hook_url = os.environ['HOOK_URL']
+                  self.allowed_ips = [ip.strip() for ip in os.environ['ALLOWED_IP'].split(',')]
+
+              def is_allowed_ip(self, ip):
+                  return ip in self.allowed_ips
+
+              def convert_to_kst(self, utc_time_str):
+                  try:
+                      utc_time = datetime.strptime(utc_time_str, '%Y-%m-%dT%H:%M:%SZ')
+                      kst_time = utc_time + timedelta(hours=9)
+                      return kst_time.strftime('%Y-%m-%d %H:%M:%S KST')
+                  except Exception as e:
+                      self.logger.error(f"Error converting time: {str(e)}")
+                      return utc_time_str
+
+              def send_slack_message(self, message):
+                  try:
+                      req = Request(self.hook_url, data=json.dumps(message).encode('utf-8'))
+                      response = urlopen(req)
+                      response.read()
+                      self.logger.info("Message posted successfully")
+                  except HTTPError as e:
+                      self.logger.error("Request failed: %d %s", e.code, e.reason)
+                  except URLError as e:
+                      self.logger.error("Server connection failed: %s", e.reason)
+
+              def create_base_slack_message(self, title, mention=""):
+                  return {
+                      "attachments": [{"blocks": []}],
+                      "blocks": [
+                          {
+                              "type": "section",
+                              "text": {
+                                  "type": "mrkdwn",
+                                  "text": f"{mention}{title}"
+                              }
+                          },
+                          {"type": "divider"}
+                      ]
+                  }
+
+              def add_fields_to_message(self, message, fields):
+                  message["attachments"][0]["blocks"].append({
+                      "type": "section",
+                      "fields": [
+                          {
+                              "type": "mrkdwn",
+                              "text": f"*{key}:*\n{value}"
+                          } for key, value in fields.items()
+                      ]
+                  })
+                  return message
+
+          class IAMHandler(BaseHandler):
+              def get_event_description(self, event_name, request_params):
+                  descriptions = {
+                      'CreateUser': f"New IAM user '{request_params.get('userName', 'N/A')}' created",
+                      'DeleteUser': f"IAM user '{request_params.get('userName', 'N/A')}' deleted",
+                      'AddUserToGroup': f"User '{request_params.get('userName', 'N/A')}' added to group '{request_params.get('groupName', 'N/A')}'",
+                      'RemoveUserFromGroup': f"User '{request_params.get('userName', 'N/A')}' removed from group '{request_params.get('groupName', 'N/A')}'",
+                      'AttachUserPolicy': f"Policy '{request_params.get('policyArn', 'N/A')}' attached to user '{request_params.get('userName', 'N/A')}'",
+                      'AttachGroupPolicy': f"Policy '{request_params.get('policyArn', 'N/A')}' attached to group '{request_params.get('groupName', 'N/A')}'",
+                      'CreateAccessKey': f"New access key created for user '{request_params.get('userName', 'N/A')}'",
+                      'DeleteAccessKey': f"Access key deleted for user '{request_params.get('userName', 'N/A')}'",
+                      'UpdateAccountPasswordPolicy': "Account password policy has been modified"
+                  }
+                  return descriptions.get(event_name, f"IAM event {event_name} performed")
+
+          def lambda_handler(event, context):
+              handler = IAMHandler()
+              handler.logger.info(f"Received event: {json.dumps(event)}")
+              
+              try:
+                  detail = event['detail']
+                  event_name = detail['eventName']
+                  event_time = handler.convert_to_kst(event['time'])
+                  
+                  user_identity = detail.get('userIdentity', {})
+                  request_params = detail.get('requestParameters', {})
+                  
+                  user_type = user_identity.get('type', 'Unknown')
+                  user_name = user_identity.get('userName', 'Unknown')
+                  source_ip = detail.get('sourceIPAddress', 'Unknown')
+                  
+                  description = handler.get_event_description(event_name, request_params)
+                  mention = "<!channel> " if (not handler.is_allowed_ip(source_ip)) else ""
+                  
+                  slack_message = handler.create_base_slack_message(
+                      f"IAM Security Alert: {description}",
+                      mention
+                  )
+                  
+                  fields = {
+                      "Event Type": event_name,
+                      "Initiated By": f"{user_type} ({user_name})",
+                      "Source IP": source_ip,
+                      "Region": detail.get('awsRegion', 'Unknown'),
+                      "Event Time": event_time
+                  }
+                  handler.add_fields_to_message(slack_message, fields)
+                  
+                  slack_message["attachments"][0]["blocks"].append({
+                      "type": "section",
+                      "text": {
+                          "type": "mrkdwn",
+                          "text": f"*Details:*\n```{json.dumps(request_params, indent=2)}```"
+                      }
+                  })
+                  
+                  handler.send_slack_message(slack_message)
+                  return {'statusCode': 200}
+                  
+              except Exception as e:
+                  handler.logger.error(f"Error processing event: {str(e)}")
+                  raise
+
+  ConsoleLoginEventHandlerFunction:
+    Type: AWS::Lambda::Function
+    Condition: IsPrimaryRegion
+    Properties:
+      FunctionName: ConsoleLoginEventHandler
+      Runtime: python3.10
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 128
+      Environment:
+        Variables:
+          HOOK_URL: !Ref SlackWebhookUrl
+          ALLOWED_IP: !Ref AllowedIpAddresses
+      Code:
+        ZipFile: |
+          import json
+          import os
+          from datetime import datetime, timedelta
+          from urllib.request import Request, urlopen
+          from urllib.error import URLError, HTTPError
+          import logging
+
+          class BaseHandler:
+              def __init__(self):
+                  self.logger = logging.getLogger()
+                  self.logger.setLevel(logging.INFO)
+                  self.hook_url = os.environ['HOOK_URL']
+                  self.allowed_ips = [ip.strip() for ip in os.environ['ALLOWED_IP'].split(',')]
+
+              def is_allowed_ip(self, ip):
+                  return ip in self.allowed_ips
+
+              def convert_to_kst(self, utc_time_str):
+                  try:
+                      utc_time = datetime.strptime(utc_time_str, '%Y-%m-%dT%H:%M:%SZ')
+                      kst_time = utc_time + timedelta(hours=9)
+                      return kst_time.strftime('%Y-%m-%d %H:%M:%S KST')
+                  except Exception as e:
+                      self.logger.error(f"Error converting time: {str(e)}")
+                      return utc_time_str
+
+              def send_slack_message(self, message):
+                  try:
+                      req = Request(self.hook_url, data=json.dumps(message).encode('utf-8'))
+                      response = urlopen(req)
+                      response.read()
+                      self.logger.info("Message posted successfully")
+                  except HTTPError as e:
+                      self.logger.error("Request failed: %d %s", e.code, e.reason)
+                  except URLError as e:
+                      self.logger.error("Server connection failed: %s", e.reason)
+
+              def create_base_slack_message(self, title, mention=""):
+                  return {
+                      "attachments": [{"blocks": []}],
+                      "blocks": [
+                          {
+                              "type": "section",
+                              "text": {
+                                  "type": "mrkdwn",
+                                  "text": f"{mention}{title}"
+                              }
+                          },
+                          {"type": "divider"}
+                      ]
+                  }
+
+              def add_fields_to_message(self, message, fields):
+                  message["attachments"][0]["blocks"].append({
+                      "type": "section",
+                      "fields": [
+                          {
+                              "type": "mrkdwn",
+                              "text": f"*{key}:*\n{value}"
+                          } for key, value in fields.items()
+                      ]
+                  })
+                  return message
+
+          def lambda_handler(event, context):
+              handler = BaseHandler()
+              handler.logger.info(f"Received event: {json.dumps(event)}")
+              
+              try:
+                  detail = event['detail']
+                  event_time = handler.convert_to_kst(event['time'])
+                  
+                  user_identity = detail.get('userIdentity', {})
+                  user_type = user_identity.get('type', 'Unknown')
+                  user_name = user_identity.get('userName', 'Unknown')
+                  
+                  response_elements = detail.get('responseElements', {})
+                  additional_data = detail.get('additionalEventData', {})
+                  
+                  login_result = response_elements.get('ConsoleLogin', 'Unknown')
+                  mfa_used = additional_data.get('MFAUsed', 'Unknown')
+                  source_ip = detail.get('sourceIPAddress', 'Unknown')
+                  
+                  user_identifier = "Root account" if user_type == "Root" else f"IAM user ({user_name})"
+                  
+                  mention = "<!channel> " if (not handler.is_allowed_ip(source_ip)) else ""
+                  slack_message = handler.create_base_slack_message(
+                      f"Login detected - {user_identifier} {login_result} from {source_ip}",
+                      mention
+                  )
+                  
+                  fields = {
+                      "Account Type": user_type,
+                      "User Name": user_name,
+                      "MFA Used": mfa_used,
+                      "Access IP": source_ip,
+                      "Event Time": event_time
+                  }
+                  handler.add_fields_to_message(slack_message, fields)
+                  
+                  slack_message["attachments"][0]["color"] = "#eb4034" if user_type == "Root" else "#0c3f7d"
+                  
+                  handler.send_slack_message(slack_message)
+                  return {'statusCode': 200}
+                  
+              except Exception as e:
+                  handler.logger.error(f"Error processing event: {str(e)}")
+                  raise
+
+  #################################################
+  # Regional Service Lambda Functions (Primary Region Only)
+  #################################################
+  EC2EventHandlerFunction:
+    Type: AWS::Lambda::Function
+    Condition: IsPrimaryRegion
+    Properties:
+      FunctionName: EC2EventHandler
+      Runtime: python3.10
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 128
+      Environment:
+        Variables:
+          HOOK_URL: !Ref SlackWebhookUrl
+          ALLOWED_IP: !Ref AllowedIpAddresses
+      Code:
+        ZipFile: |
+          import json
+          import os
+          from datetime import datetime, timedelta
+          from urllib.request import Request, urlopen
+          from urllib.error import URLError, HTTPError
+          import logging
+
+          class BaseHandler:
+              def __init__(self):
+                  self.logger = logging.getLogger()
+                  self.logger.setLevel(logging.INFO)
+                  self.hook_url = os.environ['HOOK_URL']
+                  self.allowed_ips = [ip.strip() for ip in os.environ['ALLOWED_IP'].split(',')]
+
+              def is_allowed_ip(self, ip):
+                  return ip in self.allowed_ips
+
+              def convert_to_kst(self, utc_time_str):
+                  try:
+                      utc_time = datetime.strptime(utc_time_str, '%Y-%m-%dT%H:%M:%SZ')
+                      kst_time = utc_time + timedelta(hours=9)
+                      return kst_time.strftime('%Y-%m-%d %H:%M:%S KST')
+                  except Exception as e:
+                      self.logger.error(f"Error converting time: {str(e)}")
+                      return utc_time_str
+
+              def send_slack_message(self, message):
+                  try:
+                      req = Request(self.hook_url, data=json.dumps(message).encode('utf-8'))
+                      response = urlopen(req)
+                      response.read()
+                      self.logger.info("Message posted successfully")
+                  except HTTPError as e:
+                      self.logger.error("Request failed: %d %s", e.code, e.reason)
+                  except URLError as e:
+                      self.logger.error("Server connection failed: %s", e.reason)
+
+              def create_base_slack_message(self, title, mention=""):
+                  return {
+                      "attachments": [{"blocks": []}],
+                      "blocks": [
+                          {
+                              "type": "section",
+                              "text": {
+                                  "type": "mrkdwn",
+                                  "text": f"{mention}{title}"
+                              }
+                          },
+                          {"type": "divider"}
+                      ]
+                  }
+
+              def add_fields_to_message(self, message, fields):
+                  message["attachments"][0]["blocks"].append({
+                      "type": "section",
+                      "fields": [
+                          {
+                              "type": "mrkdwn",
+                              "text": f"*{key}:*\n{value}"
+                          } for key, value in fields.items()
+                      ]
+                  })
+                  return message
+
+          class EC2Handler(BaseHandler):
+              def get_event_description(self, event_name, request_params):
+                  if event_name == 'CreateInstanceConnectEndpoint':
+                      subnet_id = request_params.get('CreateInstanceConnectEndpointRequest', {}).get('SubnetId', 'N/A')
+                      return f"New Instance Connect Endpoint created for subnet '{subnet_id}'"
+                      
+                  descriptions = {
+                      'EnableHttpEndpoint': f"IMDS HTTP endpoint enabled for resource '{request_params.get('resourceId', 'N/A')}'",
+                      'OpenTunnel': f"SSH tunnel opened to instance '{request_params.get('instanceId', 'N/A')}'",
+                      'SendSSHPublicKey': f"SSH public key sent for instance '{request_params.get('instanceId', 'N/A')}'"
+                  }
+                  
+                  if event_name == 'AuthorizeSecurityGroupIngress':
+                      return self._format_security_group_description(request_params, "added")
+                  elif event_name == 'RevokeSecurityGroupIngress':
+                      return self._format_security_group_description(request_params, "removed")
+                      
+                  return descriptions.get(event_name, f"EC2 event {event_name} performed")
+              
+              def _format_security_group_description(self, params, action):
+                  group_id = params.get('groupId', 'N/A')
+                  ip_permissions = params.get('ipPermissions', {}).get('items', [])
+                  
+                  if not ip_permissions:
+                      return f"Security group '{group_id}' ingress rules {action}"
+                      
+                  rules = []
+                  for perm in ip_permissions:
+                      protocol = perm.get('ipProtocol', 'N/A')
+                      from_port = perm.get('fromPort', 'N/A')
+                      to_port = perm.get('toPort', 'N/A')
+                      
+                      ranges = []
+                      ip_ranges = perm.get('ipRanges', {}).get('items', [])
+                      for ip_range in ip_ranges:
+                          cidr = ip_range.get('cidrIp', 'N/A')
+                          desc = ip_range.get('description', '')
+                          ranges.append(f"{cidr} ({desc})" if desc else cidr)
+                          
+                      port_range = f"port {from_port}" if from_port == to_port else f"ports {from_port}-{to_port}"
+                      rules.append(f"{protocol} {port_range} from {', '.join(ranges)}")
+                      
+                  return f"Security group '{group_id}' ingress rules {action}: {'; '.join(rules)}"
+
+              def is_high_risk_event(self, event_name, source_ip, request_params):
+                  if not self.is_allowed_ip(source_ip):
+                      return True
+                      
+                  if event_name == 'AuthorizeSecurityGroupIngress':
+                      ip_permissions = request_params.get('ipPermissions', {}).get('items', [])
+                      for perm in ip_permissions:
+                          ip_ranges = perm.get('ipRanges', {}).get('items', [])
+                          for ip_range in ip_ranges:
+                              if ip_range.get('cidrIp') == '0.0.0.0/0':
+                                  return True
+                                  
+                  if event_name in ['OpenTunnel', 'SendSSHPublicKey']:
+                      return True
+                      
+                  return False
+
+          def lambda_handler(event, context):
+              handler = EC2Handler()
+              handler.logger.info(f"Received event: {json.dumps(event)}")
+              
+              try:
+                  detail = event['detail']
+                  event_name = detail['eventName']
+                  event_time = handler.convert_to_kst(event['time'])
+                  
+                  user_identity = detail.get('userIdentity', {})
+                  request_params = detail.get('requestParameters', {})
+                  error_code = detail.get('errorCode')
+                  error_message = detail.get('errorMessage')
+                  
+                  user_type = user_identity.get('type', 'Unknown')
+                  user_name = user_identity.get('userName', 'Unknown')
+                  source_ip = detail.get('sourceIPAddress', 'Unknown')
+                  
+                  description = handler.get_event_description(event_name, request_params)
+                  is_high_risk = handler.is_high_risk_event(event_name, source_ip, request_params)
+                  
+                  mention = "<!channel> " if is_high_risk else ""
+                  
+                  if error_code:
+                      description = f"{description} (Failed - {error_code}: {error_message})"
+                  
+                  slack_message = handler.create_base_slack_message(
+                      f"EC2 Security Alert: {description}",
+                      mention
+                  )
+                  
+                  fields = {
+                      "Event Type": event_name,
+                      "Initiated By": f"{user_type} ({user_name})",
+                      "Source IP": source_ip,
+                      "Region": detail.get('awsRegion', 'Unknown'),
+                      "Event Time": event_time
+                  }
+                  
+                  if event_name in ['OpenTunnel', 'SendSSHPublicKey']:
+                      fields["Target Instance"] = request_params.get('instanceId', 'N/A')
+                  elif event_name == 'CreateInstanceConnectEndpoint':
+                      vpc_id = detail.get('responseElements', {}).get('CreateInstanceConnectEndpointResponse', {}).get('instanceConnectEndpoint', {}).get('vpcId', 'N/A')
+                      fields["VPC ID"] = vpc_id
+                  
+                  handler.add_fields_to_message(slack_message, fields)
+                  
+                  slack_message["attachments"][0]["blocks"].append({
+                      "type": "section",
+                      "text": {
+                          "type": "mrkdwn",
+                          "text": f"*Details:*\n```{json.dumps(request_params, indent=2)}```"
+                      }
+                  })
+                  
+                  slack_message["attachments"][0]["color"] = "#FF0000" if is_high_risk else "#0c3f7d"
+                  
+                  handler.send_slack_message(slack_message)
+                  return {'statusCode': 200}
+                  
+              except Exception as e:
+                  handler.logger.error(f"Error processing event: {str(e)}")
+                  raise
+
+  SecretsManagerEventHandlerFunction:
+    Type: AWS::Lambda::Function
+    Condition: IsPrimaryRegion
+    Properties:
+      FunctionName: SecretsManagerEventHandler
+      Runtime: python3.10
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 128
+      Environment:
+        Variables:
+          HOOK_URL: !Ref SlackWebhookUrl
+          ALLOWED_IP: !Ref AllowedIpAddresses
+      Code:
+        ZipFile: |
+          import json
+          import os
+          from datetime import datetime, timedelta
+          from urllib.request import Request, urlopen
+          from urllib.error import URLError, HTTPError
+          import logging
+
+          class BaseHandler:
+              def __init__(self):
+                  self.logger = logging.getLogger()
+                  self.logger.setLevel(logging.INFO)
+                  self.hook_url = os.environ['HOOK_URL']
+                  self.allowed_ips = [ip.strip() for ip in os.environ['ALLOWED_IP'].split(',')]
+
+              def is_allowed_ip(self, ip):
+                  return ip in self.allowed_ips
+
+              def convert_to_kst(self, utc_time_str):
+                  try:
+                      utc_time = datetime.strptime(utc_time_str, '%Y-%m-%dT%H:%M:%SZ')
+                      kst_time = utc_time + timedelta(hours=9)
+                      return kst_time.strftime('%Y-%m-%d %H:%M:%S KST')
+                  except Exception as e:
+                      self.logger.error(f"Error converting time: {str(e)}")
+                      return utc_time_str
+
+              def send_slack_message(self, message):
+                  try:
+                      req = Request(self.hook_url, data=json.dumps(message).encode('utf-8'))
+                      response = urlopen(req)
+                      response.read()
+                      self.logger.info("Message posted successfully")
+                  except HTTPError as e:
+                      self.logger.error("Request failed: %d %s", e.code, e.reason)
+                  except URLError as e:
+                      self.logger.error("Server connection failed: %s", e.reason)
+
+              def create_base_slack_message(self, title, mention=""):
+                  return {
+                      "attachments": [{"blocks": []}],
+                      "blocks": [
+                          {
+                              "type": "section",
+                              "text": {
+                                  "type": "mrkdwn",
+                                  "text": f"{mention}{title}"
+                              }
+                          },
+                          {"type": "divider"}
+                      ]
+                  }
+
+              def add_fields_to_message(self, message, fields):
+                  message["attachments"][0]["blocks"].append({
+                      "type": "section",
+                      "fields": [
+                          {
+                              "type": "mrkdwn",
+                              "text": f"*{key}:*\n{value}"
+                          } for key, value in fields.items()
+                      ]
+                  })
+                  return message
+
+          class SecretsManagerHandler(BaseHandler):
+              def get_event_description(self, event_name, request_params):
+                  descriptions = {
+                      'CreateSecret': "New secret created",
+                      'UpdateSecret': "Secret was updated",
+                      'DeleteSecret': "Secret was deleted",
+                      'GetSecretValue': "Secret value was retrieved",
+                      'BatchGetSecretValue': "Multiple secret values were retrieved",
+                      'RestoreSecret': "Secret was restored",
+                      'PutResourcePolicy': "Resource policy was modified for secret",
+                      'DeleteResourcePolicy': "Resource policy was removed from secret",
+                      'RotateSecret': "Manual rotation triggered for secret",
+                      'PutRotationSchedule': "Rotation schedule modified for secret",
+                      'ListSecrets': "List of secrets was retrieved"
+                  }
+                  return descriptions.get(event_name, f"Secrets Manager event {event_name} performed")
+
+          def lambda_handler(event, context):
+              handler = SecretsManagerHandler()
+              
+              try:
+                  detail = event['detail']
+                  event_name = detail['eventName']
+                  event_time = handler.convert_to_kst(event['time'])
+                  
+                  user_identity = detail.get('userIdentity', {})
+                  request_params = detail.get('requestParameters', {})
+                  
+                  user_type = user_identity.get('type', 'Unknown')
+                  user_name = user_identity.get('userName', 'Unknown')
+                  access_key = user_identity.get('accessKeyId', '')
+                  invoked_by = user_identity.get('invokedBy', '')
+                  source_ip = detail.get('sourceIPAddress', 'Unknown')
+                  
+                  if access_key:
+                      user_name = f"{user_name} (AccessKey: {access_key})"
+                  elif invoked_by:
+                      user_name = f"{user_name} (invoked by {invoked_by})"
+                  
+                  description = handler.get_event_description(event_name, request_params)
+                  
+                  high_risk_operations = ['DeleteSecret', 'PutResourcePolicy', 'DeleteResourcePolicy']
+                  
+                  mention = "<!channel> " if (event_name in high_risk_operations or not handler.is_allowed_ip(source_ip)) else ""
+                  
+                  slack_message = handler.create_base_slack_message(
+                      f"Secrets Manager Security Alert: {description}",
+                      mention
+                  )
+                  
+                  fields = {
+                      "Event Type": event_name,
+                      "Initiated By": f"{user_type} ({user_name})",
+                      "Source IP": source_ip,
+                      "Region": detail.get('awsRegion', 'Unknown'),
+                      "Event Time": event_time
+                  }
+                  handler.add_fields_to_message(slack_message, fields)
+                  
+                  safe_params = request_params.copy()
+                  if 'ClientRequestToken' in safe_params:
+                      del safe_params['ClientRequestToken']
+                  if 'SecretString' in safe_params:
+                      safe_params['SecretString'] = '[REDACTED]'
+                  if 'SecretBinary' in safe_params:
+                      safe_params['SecretBinary'] = '[REDACTED]'
+                  
+                  if 'errorCode' in detail:
+                      safe_params['error'] = {
+                          'code': detail['errorCode'],
+                          'message': detail.get('errorMessage', 'No message')
+                      }
+                      
+                  slack_message["attachments"][0]["blocks"].append({
+                      "type": "section",
+                      "text": {
+                          "type": "mrkdwn",
+                          "text": f"*Details:*\n```{json.dumps(safe_params, indent=2)}```"
+                      }
+                  })
+                  
+                  handler.send_slack_message(slack_message)
+                  return {'statusCode': 200}
+                  
+              except Exception as e:
+                  handler.logger.error(f"Error processing event: {str(e)}")
+                  raise
+
+  RDSEventHandlerFunction:
+    Type: AWS::Lambda::Function
+    Condition: IsPrimaryRegion
+    Properties:
+      FunctionName: RDSEventHandler
+      Runtime: python3.10
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 128
+      Environment:
+        Variables:
+          HOOK_URL: !Ref SlackWebhookUrl
+          ALLOWED_IP: !Ref AllowedIpAddresses
+      Code:
+        ZipFile: |
+          import json
+          import os
+          from datetime import datetime, timedelta
+          from urllib.request import Request, urlopen
+          from urllib.error import URLError, HTTPError
+          import logging
+
+          class BaseHandler:
+              def __init__(self):
+                  self.logger = logging.getLogger()
+                  self.logger.setLevel(logging.INFO)
+                  self.hook_url = os.environ['HOOK_URL']
+                  self.allowed_ips = [ip.strip() for ip in os.environ['ALLOWED_IP'].split(',')]
+
+              def is_allowed_ip(self, ip):
+                  return ip in self.allowed_ips
+
+              def convert_to_kst(self, utc_time_str):
+                  try:
+                      utc_time = datetime.strptime(utc_time_str, '%Y-%m-%dT%H:%M:%SZ')
+                      kst_time = utc_time + timedelta(hours=9)
+                      return kst_time.strftime('%Y-%m-%d %H:%M:%S KST')
+                  except Exception as e:
+                      self.logger.error(f"Error converting time: {str(e)}")
+                      return utc_time_str
+
+              def send_slack_message(self, message):
+                  try:
+                      req = Request(self.hook_url, data=json.dumps(message).encode('utf-8'))
+                      response = urlopen(req)
+                      response.read()
+                      self.logger.info("Message posted successfully")
+                  except HTTPError as e:
+                      self.logger.error("Request failed: %d %s", e.code, e.reason)
+                  except URLError as e:
+                      self.logger.error("Server connection failed: %s", e.reason)
+
+              def create_base_slack_message(self, title, mention=""):
+                  return {
+                      "attachments": [{"blocks": []}],
+                      "blocks": [
+                          {
+                              "type": "section",
+                              "text": {
+                                  "type": "mrkdwn",
+                                  "text": f"{mention}{title}"
+                              }
+                          },
+                          {"type": "divider"}
+                      ]
+                  }
+
+              def add_fields_to_message(self, message, fields):
+                  message["attachments"][0]["blocks"].append({
+                      "type": "section",
+                      "fields": [
+                          {
+                              "type": "mrkdwn",
+                              "text": f"*{key}:*\n{value}"
+                          } for key, value in fields.items()
+                      ]
+                  })
+                  return message
+
+          class RDSHandler(BaseHandler):
+              def get_event_description(self, event_name, request_params):
+                  if event_name == 'EnableHttpEndpoint':
+                      resource_arn = request_params.get('resourceArn', 'N/A')
+                      return f"HTTP Endpoint enabled for RDS resource: {resource_arn}"
+                      
+                  return f"RDS event {event_name} performed"
+
+          def lambda_handler(event, context):
+              handler = RDSHandler()
+              handler.logger.info(f"Received event: {json.dumps(event)}")
+              
+              try:
+                  detail = event['detail']
+                  event_name = detail['eventName']
+                  event_time = handler.convert_to_kst(event['time'])
+                  
+                  user_identity = detail.get('userIdentity', {})
+                  request_params = detail.get('requestParameters', {})
+                  error_code = detail.get('errorCode')
+                  error_message = detail.get('errorMessage')
+                  
+                  user_type = user_identity.get('type', 'Unknown')
+                  user_name = user_identity.get('userName', 'Unknown')
+                  source_ip = detail.get('sourceIPAddress', 'Unknown')
+                  
+                  description = handler.get_event_description(event_name, request_params)
+                  mention = "<!channel> "
+                  
+                  if error_code:
+                      description = f"{description} (Failed - {error_code}: {error_message})"
+                  
+                  slack_message = handler.create_base_slack_message(
+                      f"RDS Security Alert: {description}",
+                      mention
+                  )
+                  
+                  fields = {
+                      "Event Type": event_name,
+                      "Initiated By": f"{user_type} ({user_name})",
+                      "Source IP": source_ip,
+                      "Region": detail.get('awsRegion', 'Unknown'),
+                      "Event Time": event_time,
+                      "Target Resource": request_params.get('resourceArn', 'N/A')
+                  }
+                  
+                  handler.add_fields_to_message(slack_message, fields)
+                  
+                  slack_message["attachments"][0]["color"] = "#FF0000"
+                  
+                  handler.send_slack_message(slack_message)
+                  return {'statusCode': 200}
+                  
+              except Exception as e:
+                  handler.logger.error(f"Error processing event: {str(e)}")
+                  raise
+
+  #################################################
+  # Lambda Permissions
+  #################################################
+  IAMEventHandlerPermission:
+    Type: AWS::Lambda::Permission
+    Condition: IsPrimaryRegion
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref IAMEventHandlerFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt IAMEventRule.Arn
+
+  ConsoleLoginEventHandlerPermission:
+    Type: AWS::Lambda::Permission
+    Condition: IsPrimaryRegion
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ConsoleLoginEventHandlerFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ConsoleLoginEventRule.Arn
+
+  EC2EventHandlerPermission:
+    Type: AWS::Lambda::Permission
+    Condition: IsPrimaryRegion
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref EC2EventHandlerFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt EC2EventRule.Arn
+
+  SecretsManagerEventHandlerPermission:
+    Type: AWS::Lambda::Permission
+    Condition: IsPrimaryRegion
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref SecretsManagerEventHandlerFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt SecretsManagerEventRule.Arn
+
+  RDSEventHandlerPermission:
+    Type: AWS::Lambda::Permission
+    Condition: IsPrimaryRegion
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref RDSEventHandlerFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt RDSEventRule.Arn
+
+  #################################################
+  # EventBridge Rules - Global Services (Primary Region Only)
+  #################################################
+  IAMEventRule:
+    Type: AWS::Events::Rule
+    Condition: IsPrimaryRegion
+    Properties:
+      Name: IAMEventRule
+      EventPattern:
+        source: ["aws.iam"]
+        detail-type: ["AWS API Call via CloudTrail"]
+        detail:
+          eventSource: ["iam.amazonaws.com"]
+          eventName:
+            - "CreateUser"
+            - "DeleteUser"
+            - "UpdateUser"
+            - "AddUserToGroup"
+            - "RemoveUserFromGroup"
+            - "CreateGroup"
+            - "DeleteGroup"
+            - "UpdateGroup"
+            - "AttachUserPolicy"
+            - "DetachUserPolicy"
+            - "AttachGroupPolicy"
+            - "DetachGroupPolicy"
+            - "PutUserPolicy"
+            - "DeleteUserPolicy"
+            - "PutGroupPolicy"
+            - "DeleteGroupPolicy"
+            - "CreateAccessKey"
+            - "DeleteAccessKey"
+            - "UpdateAccessKey"
+            - "CreateLoginProfile"
+            - "DeleteLoginProfile"
+            - "UpdateLoginProfile"
+            - "UpdateAccountPasswordPolicy"
+      State: ENABLED
+      Description: AWS IAM event notification
+      EventBusName: default
+      Targets:
+        - Id: IAMEventHandlerTarget
+          Arn: !GetAtt IAMEventHandlerFunction.Arn
+
+  ConsoleLoginEventRule:
+    Type: AWS::Events::Rule
+    Condition: IsPrimaryRegion
+    Properties:
+      Name: ConsoleLoginEventRule
+      EventPattern:
+        source: ["aws.signin"]
+        detail:
+          eventSource: ["signin.amazonaws.com"]
+          eventName: ["ConsoleLogin"]
+      State: ENABLED
+      Description: AWS console login notification
+      EventBusName: default
+      Targets:
+        - Id: ConsoleLoginEventHandlerTarget
+          Arn: !GetAtt ConsoleLoginEventHandlerFunction.Arn
+
+  #################################################
+  # EventBridge Rules - Regional Services (All Regions)
+  #################################################
+  EC2EventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: EC2EventRule
+      EventPattern:
+        source: ["aws.ec2", "aws.ec2-instance-connect"]
+        detail-type: ["AWS API Call via CloudTrail"]
+        detail:
+          eventSource: ["ec2.amazonaws.com", "ec2-instance-connect.amazonaws.com"]
+          eventName:
+            - "AuthorizeSecurityGroupIngress"
+            - "CreateInstanceConnectEndpoint"
+            - "OpenTunnel"
+            - "SendSSHPublicKey"
+            - "RevokeSecurityGroupIngress"
+      State: ENABLED
+      Description: EC2 event notification
+      EventBusName: !If
+        - IsPrimaryRegion
+        - !Ref SecurityEventBus
+        - default
+      Targets: !If
+        - IsPrimaryRegion
+        - - Id: EC2EventHandlerTarget
+            Arn: !GetAtt EC2EventHandlerFunction.Arn
+        - - Id: EC2CrossRegionTarget
+            Arn: !Sub arn:aws:events:${PrimaryRegion}:${AWS::AccountId}:event-bus/security-event-bus
+            RoleArn: !GetAtt CrossRegionEventRole.Arn
+
+  SecretsManagerEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: SecretsManagerEventRule
+      EventPattern:
+        source: ["aws.secretsmanager"]
+        detail-type: ["AWS API Call via CloudTrail"]
+        detail:
+          eventSource: ["secretsmanager.amazonaws.com"]
+          eventName:
+            - "CreateSecret"
+            - "UpdateSecret"
+            - "DeleteSecret"
+            - "GetSecretValue"
+            - "BatchGetSecretValue"
+            - "RestoreSecret"
+            - "PutResourcePolicy"
+            - "DeleteResourcePolicy"
+            - "RotateSecret"
+            - "PutRotationSchedule"
+            - "PutSecretValue"
+            - "DescribeSecret"
+          userIdentity:
+            type: ["Root", "IAMUser"]
+      State: ENABLED
+      Description: AWS Secrets Manager event notification
+      EventBusName: !If
+        - IsPrimaryRegion
+        - !Ref SecurityEventBus
+        - default
+      Targets: !If
+        - IsPrimaryRegion
+        - - Id: SecretsManagerEventHandlerTarget
+            Arn: !GetAtt SecretsManagerEventHandlerFunction.Arn
+        - - Id: SecretsManagerCrossRegionTarget
+            Arn: !Sub arn:aws:events:${PrimaryRegion}:${AWS::AccountId}:event-bus/security-event-bus
+            RoleArn: !GetAtt CrossRegionEventRole.Arn
+
+  RDSEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: RDSEventRule
+      EventPattern:
+        source: ["aws.rds"]
+        detail-type: ["AWS API Call via CloudTrail"]
+        detail:
+          eventSource: ["rds.amazonaws.com"]
+          eventName: ["EnableHttpEndpoint"]
+      State: ENABLED
+      Description: AWS RDS event notification
+      EventBusName: !If
+        - IsPrimaryRegion
+        - !Ref SecurityEventBus
+        - default
+      Targets: !If
+        - IsPrimaryRegion
+        - - Id: RDSEventHandlerTarget
+            Arn: !GetAtt RDSEventHandlerFunction.Arn
+        - - Id: RDSCrossRegionTarget
+            Arn: !Sub arn:aws:events:${PrimaryRegion}:${AWS::AccountId}:event-bus/security-event-bus
+            RoleArn: !GetAtt CrossRegionEventRole.Arn
+
+Outputs:
+  CloudTrailName:
+    Condition: IsPrimaryRegion
+    Description: CloudTrail trail name
+    Value: !Sub security-cloudtrail-${AWS::StackName}
+    Export:
+      Name: !Sub ${AWS::StackName}-CloudTrailName
+
+  CloudTrailArn:
+    Condition: IsPrimaryRegion
+    Description: CloudTrail ARN
+    Value: !GetAtt CloudTrail.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-CloudTrailArn
+
+  SecurityEventBusArn:
+    Condition: IsPrimaryRegion
+    Description: ARN of the Security Event Bus
+    Value: !GetAtt SecurityEventBus.Arn
+
+  CloudTrailS3BucketName:
+    Condition: IsPrimaryRegion
+    Description: Name of the S3 bucket where CloudTrail logs are stored
+    Value: !Ref CloudTrailS3Bucket
+    Export:
+      Name: !Sub ${AWS::StackName}-S3BucketName
